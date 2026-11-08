@@ -27,7 +27,7 @@ except ImportError:
 class GeminiService:
     """Manages Gemini query parsing and comparative business explanations."""
 
-    def __init__(self, api_key: Optional[str] = None, model: str = "gemini-2.5-flash"):
+    def __init__(self, api_key: Optional[str] = None, model: str = "gemini-3.5-flash"):
         self.api_key = api_key or os.getenv("GEMINI_API_KEY", "")
         self.model = model
         self.client: Optional[genai.Client] = None
@@ -63,8 +63,8 @@ class GeminiService:
         Falls back to robust pattern extraction if live Gemini is unavailable.
         """
         if self._is_live and self.client:
-            try:
-                prompt = f"""
+            models_to_try = [self.model, "gemini-3.5-flash-lite", "gemini-3.6-flash"]
+            prompt = f"""
 You are a precise business intelligence query parser for an e-commerce company operating between January 1, 2026 and June 30, 2026.
 Extract the target metric and date/period from the user's question.
 Return ONLY valid JSON with keys:
@@ -78,18 +78,19 @@ Return ONLY valid JSON with keys:
 User question: "{query}"
 JSON:
 """
-                response = self.client.models.generate_content(
-                    model=self.model,
-                    contents=prompt,
-                )
-                raw_text = response.text.strip()
-                # Extract json substring if wrapped in markdown code fence
-                json_match = re.search(r"\{.*\}", raw_text, re.DOTALL)
-                if json_match:
-                    parsed = json.loads(json_match.group(0))
-                    return self._normalize_parsed_query(parsed, query)
-            except Exception:
-                pass
+            for m in models_to_try:
+                try:
+                    response = self.client.models.generate_content(
+                        model=m,
+                        contents=prompt,
+                    )
+                    raw_text = response.text.strip()
+                    json_match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+                    if json_match:
+                        parsed = json.loads(json_match.group(0))
+                        return self._normalize_parsed_query(parsed, query)
+                except Exception:
+                    continue
 
         # Deterministic regex parser fallback
         return self._fallback_parse_query(query)
@@ -213,12 +214,12 @@ JSON:
         
         # Format live Gemini explanation if available
         if self._is_live and self.client:
-            try:
-                evidence_text = "\n".join([
-                    f"- [{m.get('approval_status', 'N/A')}] {m.get('title', '')}: {m.get('content', '')} (Effective: {m.get('effective_start', '')})"
-                    for m in recalled_memories[:4]
-                ])
-                prompt = f"""
+            models_to_try = [self.model, "gemini-3.5-flash-lite", "gemini-3.6-flash"]
+            evidence_text = "\n".join([
+                f"- [{m.get('approval_status', 'N/A')}] {m.get('title', '')}: {m.get('content', '')} (Effective: {m.get('effective_start', '')})"
+                for m in recalled_memories[:4]
+            ])
+            prompt = f"""
 You are an expert AI business analytics consultant explaining the exact difference between an AI agent operating WITHOUT organizational memory vs WITH Hindsight memory.
 
 Question: "{query}"
@@ -238,16 +239,18 @@ Provide a JSON object with:
 - "difference_analysis": 2 sentences quantifying the delta and business impact.
 - "unresolved_conflict_or_audit": 1 sentence summarizing approvals, effective dates, or conflict resolution.
 """
-                response = self.client.models.generate_content(
-                    model=self.model,
-                    contents=prompt,
-                )
-                json_match = re.search(r"\{.*\}", response.text.strip(), re.DOTALL)
-                if json_match:
-                    data = json.loads(json_match.group(0))
-                    return data
-            except Exception:
-                pass
+            for m in models_to_try:
+                try:
+                    response = self.client.models.generate_content(
+                        model=m,
+                        contents=prompt,
+                    )
+                    json_match = re.search(r"\{.*\}", response.text.strip(), re.DOTALL)
+                    if json_match:
+                        data = json.loads(json_match.group(0))
+                        return data
+                except Exception:
+                    continue
 
         # High-fidelity analytical synthesis fallback
         return self._fallback_explanation(
