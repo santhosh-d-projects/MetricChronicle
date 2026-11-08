@@ -140,16 +140,16 @@ with st.sidebar:
     
     # Hindsight status
     if mem_svc.is_live():
-        st.markdown('<span class="status-badge badge-live">● Hindsight Live API</span>', unsafe_allow_html=True)
+        st.markdown('<span class="status-badge badge-live">● Hindsight Live Cloud API: Connected</span>', unsafe_allow_html=True)
     else:
-        st.markdown('<span class="status-badge badge-sim">⚡ Hindsight Engine (Local Bank)</span>', unsafe_allow_html=True)
-    st.caption(f"Bank: `{mem_svc.bank_id}`")
+        st.markdown('<span class="status-badge badge-sim">⚡ Local Mode (Live Cloud: 401 Unauthorized / Placeholder Key)</span>', unsafe_allow_html=True)
+    st.caption(f"Endpoint: `api.hindsight.vectorize.io` | Bank: `{mem_svc.bank_id}`")
     
     # Gemini status
     if gem_svc.is_live():
-        st.markdown('<span class="status-badge badge-live">● Gemini Live API</span>', unsafe_allow_html=True)
+        st.markdown('<span class="status-badge badge-live">● Gemini Live API: Connected</span>', unsafe_allow_html=True)
     else:
-        st.markdown('<span class="status-badge badge-sim">⚡ Grounded Model Engine</span>', unsafe_allow_html=True)
+        st.markdown('<span class="status-badge badge-sim">⚡ Local Mode (Live Cloud: 400 Invalid Key / Placeholder)</span>', unsafe_allow_html=True)
         
     st.markdown("---")
     st.subheader("Dataset Summary")
@@ -186,6 +186,13 @@ with col_head2:
     st.caption(f"📅 Active Period: Jan–Jun 2026 | 🏷️ Bank: `{mem_svc.bank_id}`")
 
 # Main Navigation Tabs
+if not (mem_svc.is_live() and gem_svc.is_live()):
+    st.info(
+        "ℹ️ **Live Cloud API Status**: The API keys currently in `.env` are placeholder values (`YOUR_NEW_...`) returning HTTP 400/401 from cloud endpoints. "
+        "MetricChronicle is actively operating in **Local Verification Mode** with deterministic dataset math and memory persistence. "
+        "To enable direct Cloud API execution, replace the placeholder keys in `.env` or input live keys in the sidebar **'Override API Keys'** section."
+    )
+
 tab_ask, tab_lab, tab_eval = st.tabs([
     "💬 1. ASK THE AGENT (Comparison)",
     "🧪 2. MEMORY LAB (Retain & Recall)",
