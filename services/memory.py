@@ -100,17 +100,18 @@ SEED_RULES: List[Dict[str, Any]] = [
 
 class MemoryService:
     """Manages Hindsight memory operations with graceful resilience."""
-    
+
     def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None, bank_id: Optional[str] = None):
         self.api_key = api_key or os.getenv("HINDSIGHT_API_KEY", "")
         self.base_url = base_url or os.getenv("HINDSIGHT_BASE_URL", DEFAULT_BASE_URL)
         self.bank_id = bank_id or os.getenv("HINDSIGHT_BANK_ID", DEFAULT_BANK_ID)
-        
+
         self.client: Optional[Hindsight] = None
         self._is_live = False
+        self._seeded = False
         self._simulated_store: List[Dict[str, Any]] = []
         self._init_client()
-        
+
     def _is_valid_key(self, key: str) -> bool:
         if not key or not isinstance(key, str):
             return False
@@ -134,7 +135,7 @@ class MemoryService:
         else:
             self.client = None
             self._is_live = False
-            
+
     def is_live(self) -> bool:
         """Return True if connected to live Hindsight API endpoint."""
         return self._is_live
@@ -144,9 +145,17 @@ class MemoryService:
         Idempotently seed standard business policies into Hindsight.
         Will not re-insert duplicate memories if already present.
         """
+        if self._seeded and not force:
+            return {
+                "status": "already_seeded",
+                "inserted": 0,
+                "already_present": len(self._simulated_store),
+                "total_rules": len(self._simulated_store),
+                "is_live": self._is_live,
+            }
         inserted_count = 0
         already_present = 0
-        
+
         if self._is_live and self.client:
             try:
                 # Check existing memories via recall
@@ -176,7 +185,7 @@ class MemoryService:
                         already_present += 1
             except Exception:
                 pass
-                
+
         # Always maintain local store synchronized for fast querying & fallback
         existing_ids = {m.get("id") for m in self._simulated_store}
         for rule in SEED_RULES:
@@ -187,7 +196,8 @@ class MemoryService:
             else:
                 if not self._is_live:
                     already_present += 1
-                    
+
+        self._seeded = True
         return {
             "status": "success",
             "inserted": inserted_count,
@@ -211,7 +221,7 @@ class MemoryService:
         rule_id = f"RULE-{datetime.now().strftime('%m%d%H%M%S')}"
         title = title or f"{metric} Correction by {author}"
         rule_tags = tags or [metric.lower().replace(" ", "_"), "analyst_correction"]
-        
+
         rule_dict = {
             "id": rule_id,
             "metric": metric,
@@ -224,37 +234,58 @@ class MemoryService:
             "tags": rule_tags,
             "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
-        
+
         live_success = False
+        live_error = None
         if self._is_live and self.client:
+            formatted_content = (
+                f"[{approval_status}] {title}: {content} "
+                f"Effective: {effective_start} to {effective_end}. Author: {author}."
+            )
+            retain_meta = {
+                "rule_id": rule_id,
+                "metric": metric,
+                "approval_status": approval_status,
+                "effective_start": effective_start,
+                "effective_end": effective_end,
+            }
             try:
-                formatted_content = (
-                    f"[{approval_status}] {title}: {content} "
-                    f"Effective: {effective_start} to {effective_end}. Author: {author}."
-                )
                 self.client.retain(
                     bank_id=self.bank_id,
                     content=formatted_content,
                     document_id=rule_id,
                     tags=rule_tags,
-                    metadata={
-                        "rule_id": rule_id,
-                        "metric": metric,
-                        "approval_status": approval_status,
-                        "effective_start": effective_start,
-                        "effective_end": effective_end,
-                    }
+                    metadata=retain_meta,
                 )
                 live_success = True
-            except Exception:
-                live_success = False
-                
+            except Exception as e:
+                if "event loop" in str(e).lower() or "session" in str(e).lower() or "closed" in str(e).lower():
+                    # Re-initialize client for the current thread/event loop and retry
+                    try:
+                        self._init_client()
+                        if self.client:
+                            self.client.retain(
+                                bank_id=self.bank_id,
+                                content=formatted_content,
+                                document_id=rule_id,
+                                tags=rule_tags,
+                                metadata=retain_meta,
+                            )
+                            live_success = True
+                    except Exception as retry_err:
+                        live_success = False
+                        live_error = str(retry_err)
+                else:
+                    live_success = False
+                    live_error = str(e)
+
         # Store in local memory store
         self._simulated_store.append(rule_dict)
         return {
-            "status": "retained",
+            "status": "retained" if (live_success or not self._is_live) else "error",
             "rule": rule_dict,
             "live_backend": live_success,
+            "live_error": live_error,
             "bank_id": self.bank_id,
         }
 
@@ -264,61 +295,179 @@ class MemoryService:
         Filters and ranks based on semantic relevance and temporal date matching.
         """
         recalled_items: List[Dict[str, Any]] = []
-        
+
         # 1. Attempt live recall if active
         if self._is_live and self.client:
+            resp = None
             try:
                 resp = self.client.recall(bank_id=self.bank_id, query=query, tags=tags)
-                if hasattr(resp, "results") and resp.results:
-                    for res in resp.results:
-                        text = getattr(res, "text", "") or getattr(res, "content", "") or str(res)
-                        recalled_items.append({
-                            "content": text,
-                            "relevance": getattr(res, "score", 0.95),
-                            "source": "hindsight_live",
-                        })
-            except Exception:
-                pass
-                
+            except Exception as e:
+                if "event loop" in str(e).lower() or "session" in str(e).lower() or "closed" in str(e).lower():
+                    try:
+                        self._init_client()
+                        if self.client:
+                            resp = self.client.recall(bank_id=self.bank_id, query=query, tags=tags)
+                    except Exception:
+                        resp = None
+                else:
+                    resp = None
+
+            if resp and hasattr(resp, "results") and resp.results:
+                for res in resp.results:
+                    text = getattr(res, "text", "") or getattr(res, "content", "") or str(res)
+                    res_id = getattr(res, "id", "")
+                    score = getattr(res, "score", 0.95)
+                    score_val = round(float(score), 2) if score is not None else 0.95
+
+                    # Extract title, approval status and metadata from content or seed rules
+                    extracted_title = "Hindsight Policy Memory"
+                    extracted_status = "APPROVED OFFICIAL"
+                    effective_start = "2026-01-01"
+                    effective_end = "None (Current)"
+                    author = "Hindsight Bank"
+
+                    matched_seed = False
+                    text_lower = text.lower()
+
+                    if "30 days" in text_lower or "30 day" in text_lower or "q2" in text_lower or "april 1" in text_lower:
+                        sr = next((r for r in SEED_RULES if r["id"] == "RULE-ACT-02"), None)
+                        if sr:
+                            extracted_title = sr["title"]
+                            extracted_status = sr["approval_status"]
+                            effective_start = sr["effective_start"]
+                            effective_end = sr["effective_end"]
+                            author = sr["author"]
+                            matched_seed = True
+                    elif "90 days" in text_lower or "90 day" in text_lower or "q1" in text_lower or "march 31" in text_lower or "active customer" in text_lower or "active" in text_lower:
+                        sr = next((r for r in SEED_RULES if r["id"] == "RULE-ACT-01"), None)
+                        if sr:
+                            extracted_title = sr["title"]
+                            extracted_status = sr["approval_status"]
+                            effective_start = sr["effective_start"]
+                            effective_end = sr["effective_end"]
+                            author = sr["author"]
+                            matched_seed = True
+                    elif "average order value" in text_lower or "aov" in text_lower:
+                        sr = next((r for r in SEED_RULES if r["id"] == "RULE-AOV-01"), None)
+                        if sr:
+                            extracted_title = sr["title"]
+                            extracted_status = sr["approval_status"]
+                            effective_start = sr["effective_start"]
+                            effective_end = sr["effective_end"]
+                            author = sr["author"]
+                            matched_seed = True
+                    elif "gross profit" in text_lower or "profit" in text_lower:
+                        sr = next((r for r in SEED_RULES if r["id"] == "RULE-PRF-01"), None)
+                        if sr:
+                            extracted_title = sr["title"]
+                            extracted_status = sr["approval_status"]
+                            effective_start = sr["effective_start"]
+                            effective_end = sr["effective_end"]
+                            author = sr["author"]
+                            matched_seed = True
+                    elif "rejected" in text_lower or "superseded" in text_lower or "draft" in text_lower or "unapproved" in text_lower:
+                        sr = next((r for r in SEED_RULES if r["id"] == "RULE-REV-02-DRAFT"), None)
+                        if sr:
+                            extracted_title = sr["title"]
+                            extracted_status = sr["approval_status"]
+                            effective_start = sr["effective_start"]
+                            effective_end = sr["effective_end"]
+                            author = sr["author"]
+                            matched_seed = True
+                    elif "revenue" in text_lower or "refund" in text_lower:
+                        sr = next((r for r in SEED_RULES if r["id"] == "RULE-REV-01"), None)
+                        if sr:
+                            extracted_title = sr["title"]
+                            extracted_status = sr["approval_status"]
+                            effective_start = sr["effective_start"]
+                            effective_end = sr["effective_end"]
+                            author = sr["author"]
+                            matched_seed = True
+
+                    if not matched_seed:
+                        for sr in SEED_RULES:
+                            if sr["title"].lower() in text_lower or sr["id"] == res_id or sr["id"] in text or sr["metric"].lower() in text_lower:
+                                extracted_title = sr["title"]
+                                extracted_status = sr["approval_status"]
+                                effective_start = sr["effective_start"]
+                                effective_end = sr["effective_end"]
+                                author = sr["author"]
+                                matched_seed = True
+                                break
+
+                    if not matched_seed:
+                        m_title = re.match(r"\[(.*?)\]\s*([^:]+):", text)
+                        if m_title:
+                            extracted_status = m_title.group(1).strip()
+                            extracted_title = m_title.group(2).strip()
+                        elif getattr(res, "title", None):
+                            extracted_title = str(getattr(res, "title"))
+
+                    # Apply temporal awareness to live result scoring
+                    if as_of_date:
+                        as_of_dt = pd_to_dt(as_of_date)
+                        start_dt = pd_to_dt(effective_start) if effective_start else None
+                        end_dt = pd_to_dt(effective_end) if effective_end and "none" not in effective_end.lower() else None
+                        if start_dt and as_of_dt and as_of_dt < start_dt:
+                            score_val -= 0.6  # Not yet effective
+                        elif end_dt and as_of_dt and as_of_dt > end_dt:
+                            score_val -= 0.4  # Expired/superseded
+                        else:
+                            score_val += 0.05
+                        score_val = round(max(score_val, 0.1), 2)
+
+                    recalled_items.append({
+                        "id": res_id,
+                        "title": extracted_title,
+                        "content": text,
+                        "approval_status": extracted_status,
+                        "effective_start": effective_start,
+                        "effective_end": effective_end,
+                        "author": author,
+                        "relevance": score_val,
+                        "relevance_score": score_val,
+                        "source": "hindsight_live",
+                    })
+
         # 2. Match from local rules store (with temporal awareness)
         query_lower = query.lower()
         as_of_dt = pd_to_dt(as_of_date) if as_of_date else None
-        
+
         for rule in self._simulated_store:
             score = 0.0
             rule_text = f"{rule.get('metric', '')} {rule.get('title', '')} {rule.get('content', '')} {' '.join(rule.get('tags', []))}".lower()
-            
+
             # Keyword/semantic similarity matching
             keywords = re.findall(r"\w+", query_lower)
             matched_kw = [kw for kw in keywords if kw in rule_text and len(kw) > 2]
             if matched_kw:
                 score += len(matched_kw) * 0.25
-                
+
             # Direct metric match bonus
             metric_term = rule.get("metric", "").lower()
             if metric_term in query_lower or any(t in query_lower for t in rule.get("tags", [])):
                 score += 1.0
-                
+
             # Temporal date filtering & scoring
             if as_of_dt:
                 start_str = rule.get("effective_start")
                 end_str = rule.get("effective_end", "None")
                 start_dt = pd_to_dt(start_str)
                 end_dt = pd_to_dt(end_str) if end_str and "none" not in end_str.lower() else None
-                
+
                 if start_dt and as_of_dt < start_dt:
                     score -= 1.0  # Not yet effective
                 elif end_dt and as_of_dt > end_dt:
                     score -= 0.5  # Expired/superseded
                 else:
                     score += 0.8  # Currently active for this date!
-                    
+
             if score > 0.3:
                 item = dict(rule)
                 item["relevance_score"] = round(min(score / 3.0, 1.0), 2)
                 item["source"] = "metricchronicle_bank"
                 recalled_items.append(item)
-                
+
         # Sort by relevance score descending
         recalled_items.sort(key=lambda x: x.get("relevance_score", 0.5), reverse=True)
         return recalled_items
@@ -328,36 +477,74 @@ class MemoryService:
         Synthesize context-aware conclusions from accumulated memories using Hindsight reflect.
         Identifies policy changes, overrides, and conflicts.
         """
-        # Attempt live reflect
-        if self._is_live and self.client:
-            try:
-                resp = self.client.reflect(bank_id=self.bank_id, query=query, context=context)
-                if hasattr(resp, "text") and resp.text:
-                    return resp.text
-            except Exception:
-                pass
-                
-        # High-fidelity synthesis using stored memories and rules
+        # Detect conflicts or temporal revisions from recalled context
         recalled = self.recall(query)
-        if not recalled:
-            return "No historical memory found in Hindsight bank for this query. Falling back to default generic interpretation."
-            
-        # Detect conflicts or temporal revisions
         approved_rules = [
-            r for r in recalled 
-            if "approved" in str(r.get("approval_status", "")).lower() 
+            r for r in recalled
+            if "approved" in str(r.get("approval_status", "")).lower()
             and "unapproved" not in str(r.get("approval_status", "")).lower()
             and "draft" not in str(r.get("approval_status", "")).lower()
         ]
         unapproved_rules = [
-            r for r in recalled 
-            if "unapproved" in str(r.get("approval_status", "")).lower() 
+            r for r in recalled
+            if "unapproved" in str(r.get("approval_status", "")).lower()
             or "draft" in str(r.get("approval_status", "")).lower()
         ]
-        
+
+        conflict_prefix = ""
+        if unapproved_rules and approved_rules:
+            conflict_prefix = (
+                f"- **Conflict Detected**: Detected conflicting definitions for '{approved_rules[0].get('metric', 'Metric')}'. "
+                f"Analyst draft by {unapproved_rules[0].get('author', 'Dave')} ({unapproved_rules[0].get('title', '')}) "
+                f"conflicts with official policy by {approved_rules[0].get('author', 'Leadership')}. "
+                f"Resolution: The agent strictly rejects unapproved draft notes and enforces the official policy: '{approved_rules[0].get('content', '')}'."
+            )
+
+        # Attempt live reflect
+        if self._is_live and self.client:
+            live_text = None
+            try:
+                resp = self.client.reflect(bank_id=self.bank_id, query=query, context=context)
+                if hasattr(resp, "text") and resp.text:
+                    live_text = resp.text
+            except Exception as e:
+                if "event loop" in str(e).lower() or "session" in str(e).lower() or "closed" in str(e).lower():
+                    try:
+                        self._init_client()
+                        if self.client:
+                            resp = self.client.reflect(bank_id=self.bank_id, query=query, context=context)
+                            if hasattr(resp, "text") and resp.text:
+                                live_text = resp.text
+                    except Exception:
+                        pass
+                else:
+                    pass
+            if live_text:
+                if conflict_prefix:
+                    return f"**Hindsight Memory Reflection on '{query}'**:\n\n{conflict_prefix}\n\n{live_text}"
+                return live_text
+
+        # High-fidelity synthesis using stored memories and rules
+        recalled = self.recall(query)
+        if not recalled:
+            return "No historical memory found in Hindsight bank for this query. Falling back to default generic interpretation."
+
+        # Detect conflicts or temporal revisions
+        approved_rules = [
+            r for r in recalled
+            if "approved" in str(r.get("approval_status", "")).lower()
+            and "unapproved" not in str(r.get("approval_status", "")).lower()
+            and "draft" not in str(r.get("approval_status", "")).lower()
+        ]
+        unapproved_rules = [
+            r for r in recalled
+            if "unapproved" in str(r.get("approval_status", "")).lower()
+            or "draft" in str(r.get("approval_status", "")).lower()
+        ]
+
         reflection_parts = []
         reflection_parts.append(f"**Hindsight Memory Reflection on '{query}'**:")
-        
+
         if unapproved_rules and approved_rules:
             reflection_parts.append(
                 f"- **Conflict Detected**: Detected conflicting definitions for '{approved_rules[0].get('metric', 'Metric')}'. "
@@ -377,7 +564,7 @@ class MemoryService:
                 f"Primary governing policy: \"{recalled[0].get('content', '')}\" "
                 f"(Approved: {recalled[0].get('approval_status', 'N/A')}, Effective: {recalled[0].get('effective_start', '2026-01-01')})."
             )
-            
+
         return "\n\n".join(reflection_parts)
 
     def get_all_memories(self) -> List[Dict[str, Any]]:

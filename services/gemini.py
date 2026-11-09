@@ -63,7 +63,7 @@ class GeminiService:
         Falls back to robust pattern extraction if live Gemini is unavailable.
         """
         if self._is_live and self.client:
-            models_to_try = [self.model, "gemini-3.5-flash-lite", "gemini-3.6-flash"]
+            models_to_try = [self.model, "gemini-2.0-flash", "gemini-1.5-flash"]
             prompt = f"""
 You are a precise business intelligence query parser for an e-commerce company operating between January 1, 2026 and June 30, 2026.
 Extract the target metric and date/period from the user's question.
@@ -99,7 +99,7 @@ JSON:
         metric = parsed.get("metric", "revenue")
         if metric not in ["revenue", "active_customers", "average_order_value", "profit", "general"]:
             metric = "revenue"
-            
+
         return {
             "metric": metric,
             "as_of_date": parsed.get("as_of_date") or self._infer_as_of_date(raw_query),
@@ -111,7 +111,7 @@ JSON:
 
     def _fallback_parse_query(self, query: str) -> Dict[str, Any]:
         q_lower = query.lower()
-        
+
         # Metric classification
         if any(w in q_lower for w in ["active customer", "active users", "customer count", "active buyer", "scenario 1"]):
             metric = "active_customers"
@@ -121,12 +121,12 @@ JSON:
             metric = "profit"
         else:
             metric = "revenue"
-            
+
         start_date = self._infer_start_date(query)
         end_date = self._infer_end_date(query)
         as_of_date = self._infer_as_of_date(query)
         period_name = self._infer_period_name(query)
-        
+
         return {
             "metric": metric,
             "as_of_date": as_of_date,
@@ -211,10 +211,10 @@ JSON:
         Formulates a comprehensive comparison between Without-Hindsight and With-Hindsight.
         """
         metric = with_memory_data.get("metric_name", "Revenue")
-        
+
         # Format live Gemini explanation if available
         if self._is_live and self.client:
-            models_to_try = [self.model, "gemini-3.5-flash-lite", "gemini-3.6-flash"]
+            models_to_try = [self.model, "gemini-2.0-flash", "gemini-1.5-flash"]
             evidence_text = "\n".join([
                 f"- [{m.get('approval_status', 'N/A')}] {m.get('title', '')}: {m.get('content', '')} (Effective: {m.get('effective_start', '')})"
                 for m in recalled_memories[:4]
@@ -267,14 +267,14 @@ Provide a JSON object with:
     ) -> Dict[str, Any]:
         metric = with_memory_data.get("metric_name", "Metric")
         as_of = with_memory_data.get("as_of_date", "2026-06-30")
-        
+
         # Check if temporal active customer query
         if "active" in metric.lower():
             lookback = with_memory_data.get("lookback_days", 90)
             naive_lookback = without_memory_data.get("lookback_days", 30)
             with_val = with_memory_data.get("active_customers", 0)
             without_val = without_memory_data.get("active_customers", 0)
-            
+
             critique = (
                 f"Without Hindsight, standard LLMs use a generic static 30-day window ({without_val} users), "
                 "unaware of historical team definitions or formal policy transitions across quarters."
